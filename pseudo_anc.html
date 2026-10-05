@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pseudo-ANC Experiment</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: #111;
+    color: #f5f5f7;
+    padding: 24px;
+  }
+  .card {
+    width: min(520px, 100%);
+    padding: 24px;
+    border: 1px solid #333;
+    border-radius: 24px;
+    background: #1c1c1e;
+    box-shadow: 0 18px 50px #0008;
+  }
+  h1 { margin: 0 0 6px; font-size: 30px; }
+  .sub { color: #aaa; margin: 0 0 24px; line-height: 1.4; }
+  button {
+    width: 100%;
+    border: 0;
+    border-radius: 14px;
+    padding: 15px;
+    font-size: 18px;
+    font-weight: 700;
+    background: #0a84ff;
+    color: white;
+  }
+  button.stop { background: #ff453a; }
+  .control { margin-top: 22px; }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+  label { font-weight: 600; }
+  output { color: #aaa; }
+  input[type="range"] { width: 100%; }
+  .switchRow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 22px;
+  }
+  .switch {
+    width: 54px;
+    height: 32px;
+    appearance: none;
+    border-radius: 999px;
+    background: #555;
+    position: relative;
+    transition: .2s;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    width: 26px;
+    height: 26px;
+    left: 3px;
+    top: 3px;
+    border-radius: 50%;
+    background: white;
+    transition: .2s;
+  }
+  .switch:checked { background: #30d158; }
+  .switch:checked::after { transform: translateX(22px); }
+  .status {
+    margin-top: 20px;
+    padding: 12px;
+    border-radius: 12px;
+    background: #2c2c2e;
+    color: #bbb;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .meter {
+    height: 8px;
+    background: #333;
+    border-radius: 99px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .meter > div {
+    height: 100%;
+    width: 0%;
+    background: #30d158;
+    transition: width .05s linear;
+  }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>Pseudo-ANC</h1>
+  <p class="sub">Microphone → delay → phase inversion → headphones</p>
+
+  <button id="start">Start</button>
+
+  <div class="control">
+    <div class="row">
+      <label for="volume">Output volume</label>
+      <output id="volumeValue">15%</output>
+    </div>
+    <input id="volume" type="range" min="0" max="0.5" value="0.15" step="0.01">
+  </div>
+
+  <div class="control">
+    <div class="row">
+      <label for="delay">Delay</label>
+      <output id="delayValue">5 ms</output>
+    </div>
+    <input id="delay" type="range" min="0" max="50" value="5" step="0.5">
+  </div>
+
+  <div class="switchRow">
+    <label for="invert">Phase invert</label>
+    <input id="invert" class="switch" type="checkbox" checked>
+  </div>
+
+  <div class="status">
+    <div id="status">Stopped</div>
+    <div class="meter"><div id="meter"></div></div>
+  </div>
+</main>
+
+<script>
+let ctx = null;
+let stream = null;
+let source = null;
+let delayNode = null;
+let gainNode = null;
+let inputGain = null;
+let analyser = null;
+let raf = null;
+
+const startBtn = document.getElementById("start");
+const volume = document.getElementById("volume");
+const delay = document.getElementById("delay");
+const invert = document.getElementById("invert");
+const volumeValue = document.getElementById("volumeValue");
+const delayValue = document.getElementById("delayValue");
+const status = document.getElementById("status");
+const meter = document.getElementById("meter");
+
+volume.addEventListener("input", () => {
+  volumeValue.textContent = Math.round(Number(volume.value) * 100) + "%";
+  if (gainNode) gainNode.gain.value = Number(volume.value);
+});
+
+delay.addEventListener("input", () => {
+  delayValue.textContent = Number(delay.value).toFixed(1) + " ms";
+  if (delayNode) delayNode.delayTime.value = Number(delay.value) / 1000;
+});
+
+invert.addEventListener("change", () => {
+  if (inputGain) inputGain.gain.value = invert.checked ? -1 : 1;
+});
+
+async function startAudio() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("Microphone access is not available in this browser/context.");
+    }
+
+    status.textContent = "Requesting microphone permission…";
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1
+      },
+      video: false
+    });
+
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+
+    source = ctx.createMediaStreamSource(stream);
+
+    // We invert the mic signal, then delay it before sending it to the headphones.
+    inputGain = ctx.createGain();
+    inputGain.gain.value = invert.checked ? -1 : 1;
+
+    delayNode = ctx.createDelay(0.1);
+    delayNode.delayTime.value = Number(delay.value) / 1000;
+
+    gainNode = ctx.createGain();
+    gainNode.gain.value = Number(volume.value);
+
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+
+    source
+      .connect(inputGain)
+      .connect(delayNode)
+      .connect(gainNode)
+      .connect(analyser)
+      .connect(ctx.destination);
+
+    status.textContent =
+      "Running. Keep volume low. Try a steady fan or AC hum and slowly change the delay.";
+
+    startBtn.textContent = "Stop";
+    startBtn.classList.add("stop");
+
+    startMeter();
+  } catch (err) {
+    console.error(err);
+    status.textContent = "Could not start: " + (err.message || err);
+    stopAudio();
+  }
+}
+
+function stopAudio() {
+  if (raf) cancelAnimationFrame(raf);
+  raf = null;
+
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  if (ctx) {
+    ctx.close();
+    ctx = null;
+  }
+
+  source = null;
+  delayNode = null;
+  gainNode = null;
+  inputGain = null;
+  analyser = null;
+
+  meter.style.width = "0%";
+  startBtn.textContent = "Start";
+  startBtn.classList.remove("stop");
+
+  if (!status.textContent.startsWith("Could not")) {
+    status.textContent = "Stopped";
+  }
+}
+
+function startMeter() {
+  const data = new Uint8Array(analyser.fftSize);
+
+  function draw() {
+    if (!analyser) return;
+
+    analyser.getByteTimeDomainData(data);
+
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      const x = (data[i] - 128) / 128;
+      sum += x * x;
+    }
+
+    const rms = Math.sqrt(sum / data.length);
+    const percent = Math.min(100, rms * 250);
+
+    meter.style.width = percent + "%";
+    raf = requestAnimationFrame(draw);
+  }
+
+  draw();
+}
+
+startBtn.addEventListener("click", async () => {
+  if (ctx) {
+    stopAudio();
+  } else {
+    await startAudio();
+  }
+});
+
+window.addEventListener("pagehide", stopAudio);
+</script>
+</body>
+</html>
